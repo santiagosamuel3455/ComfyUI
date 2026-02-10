@@ -7,19 +7,30 @@ import psutil
 import asyncio
 import nest_asyncio
 import gradio as gr
-import argparse  # <--- IMPORTANTE: Para leer comandos
+import argparse
 from types import ModuleType
 
 # --- 0. CONFIGURACIÓN DE ARGUMENTOS (CLI) ---
 parser = argparse.ArgumentParser(description="LTX2 Studio Launch Config")
-parser.add_argument("--unet", type=str, default="ltx-2-19b-distilled-Q4_0.gguf", help="Nombre del archivo UNET por defecto")
-parser.add_argument("--vae", type=str, default="LTX2_video_vae_bf16.safetensors", help="Nombre del archivo VAE por defecto")
-parser.add_argument("--clip1", type=str, default="gemma_3_12B_it_fp4_mixed.safetensors", help="Nombre del CLIP 1 (Gemma)")
-parser.add_argument("--clip2", type=str, default="ltx-2-19b-embeddings_connector_distill_bf16.safetensors", help="Nombre del CLIP 2 (Connector)")
-parser.add_argument("--share", action="store_true", help="Crear enlace público (Gradio Share)")
+
+# Modelos Base
+parser.add_argument("--unet", type=str, default="ltx-2-19b-distilled-Q4_0.gguf", help="UNET por defecto")
+parser.add_argument("--vae", type=str, default="LTX2_video_vae_bf16.safetensors", help="VAE por defecto")
+parser.add_argument("--clip1", type=str, default="gemma_3_12B_it_fp4_mixed.safetensors", help="CLIP 1 (Gemma)")
+parser.add_argument("--clip2", type=str, default="ltx-2-19b-embeddings_connector_distill_bf16.safetensors", help="CLIP 2 (Connector)")
+
+# LoRAs (¡NUEVO!)
+parser.add_argument("--lora1", type=str, default="None", help="Nombre del LoRA 1")
+parser.add_argument("--lora1_st", type=float, default=1.0, help="Fuerza del LoRA 1")
+parser.add_argument("--lora2", type=str, default="None", help="Nombre del LoRA 2")
+parser.add_argument("--lora2_st", type=float, default=1.0, help="Fuerza del LoRA 2")
+parser.add_argument("--lora3", type=str, default="None", help="Nombre del LoRA 3")
+parser.add_argument("--lora3_st", type=float, default=1.0, help="Fuerza del LoRA 3")
+
+# Gradio
+parser.add_argument("--share", action="store_true", help="Crear enlace público")
 parser.add_argument("--port", type=int, default=7860, help="Puerto de Gradio")
 
-# Parseamos los argumentos (usamos parse_known_args por si colab mete ruido)
 args, _ = parser.parse_known_args()
 
 # --- 1. CONFIGURACIÓN DE RUTAS ---
@@ -155,14 +166,25 @@ def generate_process(
             del vae_loader, vae_obj, img_p, lat_e, lat_v, vae_aud, lat_a; clear_all()
             yield log("🗑️ VAE liberado."), None, None
 
-            # PASO 3: UNET
+            # PASO 3: UNET + LORAS (AQUÍ ESTÁ LA MAGIA)
             yield log(f"⚡ Cargando UNET: {unet_name}"), None, None
             unet = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]().load_unet(unet_name=unet_name)[0]
             
+            # --- BLOQUE LORAS AGREGADO ---
             LoraNode = NODE_CLASS_MAPPINGS.get("LoraLoaderModelOnly", NODE_CLASS_MAPPINGS.get("LoraLoader"))
-            if l1 != "None": unet = LoraNode().load_lora_model_only(unet, l1, l1_s)[0]
-            if l2 != "None": unet = LoraNode().load_lora_model_only(unet, l2, l2_s)[0]
-            if l3 != "None": unet = LoraNode().load_lora_model_only(unet, l3, l3_s)[0]
+            
+            if l1 and l1 != "None":
+                yield log(f"💊 Aplicando LoRA 1: {l1} ({l1_s})"), None, None
+                unet = LoraNode().load_lora_model_only(unet, l1, l1_s)[0]
+            
+            if l2 and l2 != "None":
+                yield log(f"💊 Aplicando LoRA 2: {l2} ({l2_s})"), None, None
+                unet = LoraNode().load_lora_model_only(unet, l2, l2_s)[0]
+            
+            if l3 and l3 != "None":
+                yield log(f"💊 Aplicando LoRA 3: {l3} ({l3_s})"), None, None
+                unet = LoraNode().load_lora_model_only(unet, l3, l3_s)[0]
+            # -----------------------------
 
             guider = NODE_CLASS_MAPPINGS["CFGGuider"]().EXECUTE_NORMALIZED(cfg=1, model=unet, positive=cond_pos, negative=cond_neg)
             sigmas = NODE_CLASS_MAPPINGS["ManualSigmas"]().EXECUTE_NORMALIZED(sigmas=get_sigmas(steps))
@@ -237,9 +259,15 @@ with gr.Blocks(title="LTX2 APP", theme=gr.themes.Soft(primary_hue="blue", second
 
             with gr.Accordion("🎨 LoRAs", open=False):
                 loras = get_files("loras")
-                l1 = gr.Dropdown(loras, label="L1", value="None"); l1s = gr.Slider(-2, 2, 1, label="Peso")
-                l2 = gr.Dropdown(loras, label="L2", value="None"); l2s = gr.Slider(-2, 2, 1, label="Peso")
-                l3 = gr.Dropdown(loras, label="L3", value="None"); l3s = gr.Slider(-2, 2, 1, label="Peso")
+                # Se cargan los valores por defecto desde CLI
+                l1 = gr.Dropdown(loras, label="L1", value=args.lora1, allow_custom_value=True)
+                l1s = gr.Slider(-2, 2, args.lora1_st, label="Peso")
+                
+                l2 = gr.Dropdown(loras, label="L2", value=args.lora2, allow_custom_value=True)
+                l2s = gr.Slider(-2, 2, args.lora2_st, label="Peso")
+                
+                l3 = gr.Dropdown(loras, label="L3", value=args.lora3, allow_custom_value=True)
+                l3s = gr.Slider(-2, 2, args.lora3_st, label="Peso")
                 
             btn_run = gr.Button("✨ GENERAR", variant="primary", size="lg")
 
