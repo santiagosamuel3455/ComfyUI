@@ -13,13 +13,15 @@ from types import ModuleType
 # --- 0. CONFIGURACIÓN DE ARGUMENTOS (CLI) ---
 parser = argparse.ArgumentParser(description="LTX2 Studio Launch Config")
 
-# Modelos Base
-parser.add_argument("--unet", type=str, default="ltx-2-19b-distilled-Q4_0.gguf", help="UNET por defecto")
-parser.add_argument("--vae", type=str, default="LTX2_video_vae_bf16.safetensors", help="VAE por defecto")
-parser.add_argument("--clip1", type=str, default="gemma_3_12B_it_fp4_mixed.safetensors", help="CLIP 1 (Gemma)")
-parser.add_argument("--clip2", type=str, default="ltx-2-19b-embeddings_connector_distill_bf16.safetensors", help="CLIP 2 (Connector)")
+# 1. MODELOS PRINCIPALES (Según tu captura)
+parser.add_argument("--unet", type=str, default="ltx-2-19b-distilled-Q3_K_M.gguf", help="Modelo UNET (Q3, Q4, etc)")
+parser.add_argument("--vae", type=str, default="LTX2_video_vae_bf16.safetensors", help="Video VAE")
+parser.add_argument("--vae_audio", type=str, default="LTX2_audio_vae_bf16.safetensors", help="Audio VAE")
+parser.add_argument("--clip1", type=str, default="gemma_3_12B_it_fp4_mixed.safetensors", help="Text Encoder 1")
+parser.add_argument("--clip2", type=str, default="ltx-2-19b-embeddings_connector_distill_bf16.safetensors", help="Text Encoder 2")
+parser.add_argument("--upscaler", type=str, default="ltx-2-spatial-upscaler-x2-1.0.safetensors", help="Modelo de Upscale (Opcional)")
 
-# LoRAs (¡NUEVO!)
+# 2. LORAS
 parser.add_argument("--lora1", type=str, default="None", help="Nombre del LoRA 1")
 parser.add_argument("--lora1_st", type=float, default=1.0, help="Fuerza del LoRA 1")
 parser.add_argument("--lora2", type=str, default="None", help="Nombre del LoRA 2")
@@ -27,7 +29,7 @@ parser.add_argument("--lora2_st", type=float, default=1.0, help="Fuerza del LoRA
 parser.add_argument("--lora3", type=str, default="None", help="Nombre del LoRA 3")
 parser.add_argument("--lora3_st", type=float, default=1.0, help="Fuerza del LoRA 3")
 
-# Gradio
+# 3. GRADIO
 parser.add_argument("--share", action="store_true", help="Crear enlace público")
 parser.add_argument("--port", type=int, default=7860, help="Puerto de Gradio")
 
@@ -65,6 +67,7 @@ except: pass
 async def setup_nodes():
     await init_builtin_extra_nodes()
     await init_external_custom_nodes()
+    # Mapeos de seguridad
     if "VAELoaderKJ" not in NODE_CLASS_MAPPINGS:
         try:
             import nodes_vae_kj
@@ -106,7 +109,7 @@ def get_sigmas(steps):
 def generate_process(
     prompt, image, img_strength, seed, steps, res_key, seconds, fps, 
     l1, l1_s, l2, l2_s, l3, l3_s,
-    unet_name, vae_name, clip1_name, clip2_name
+    unet_name, vae_name, vae_audio_name, clip1_name, clip2_name
 ):
     clear_all()
     logs = []
@@ -138,8 +141,8 @@ def generate_process(
             del clip_data, pos, neg, cond; clear_all()
             yield log("🗑️ CLIP liberado."), None, None
 
-            # PASO 2: VAE
-            yield log(f"🖼️ Cargando VAE: {vae_name}"), None, None
+            # PASO 2: VAE (VIDEO)
+            yield log(f"🖼️ Cargando VAE Video: {vae_name}"), None, None
             vae_loader = NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vae_name)
             vae_obj = get_v(vae_loader, 0)
 
@@ -159,32 +162,29 @@ def generate_process(
                 strength=st, bypass=by, vae=vae_obj, image=get_v(img_p, 0), latent=get_v(lat_e, 0)
             )
 
-            vae_aud = NODE_CLASS_MAPPINGS["VAELoaderKJ"]().load_vae(vae_name="LTX2_audio_vae_bf16.safetensors", device="cpu", weight_dtype="fp16")[0]
+            # PASO 2.1: VAE (AUDIO) - ¡Ahora usa el argumento!
+            vae_aud = NODE_CLASS_MAPPINGS["VAELoaderKJ"]().load_vae(vae_name=vae_audio_name, device="cpu", weight_dtype="fp16")[0]
             lat_a = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]().EXECUTE_NORMALIZED(frames_number=frames, frame_rate=fps, batch_size=1, audio_vae=vae_aud)[0]
             av_in = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]().EXECUTE_NORMALIZED(video_latent=get_v(lat_v, 0), audio_latent=lat_a)[0]
 
             del vae_loader, vae_obj, img_p, lat_e, lat_v, vae_aud, lat_a; clear_all()
-            yield log("🗑️ VAE liberado."), None, None
+            yield log("🗑️ VAEs liberados."), None, None
 
-            # PASO 3: UNET + LORAS (AQUÍ ESTÁ LA MAGIA)
+            # PASO 3: UNET + LORAS
             yield log(f"⚡ Cargando UNET: {unet_name}"), None, None
             unet = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]().load_unet(unet_name=unet_name)[0]
             
-            # --- BLOQUE LORAS AGREGADO ---
             LoraNode = NODE_CLASS_MAPPINGS.get("LoraLoaderModelOnly", NODE_CLASS_MAPPINGS.get("LoraLoader"))
             
             if l1 and l1 != "None":
-                yield log(f"💊 Aplicando LoRA 1: {l1} ({l1_s})"), None, None
+                yield log(f"💊 LoRA 1: {l1}"), None, None
                 unet = LoraNode().load_lora_model_only(unet, l1, l1_s)[0]
-            
             if l2 and l2 != "None":
-                yield log(f"💊 Aplicando LoRA 2: {l2} ({l2_s})"), None, None
+                yield log(f"💊 LoRA 2: {l2}"), None, None
                 unet = LoraNode().load_lora_model_only(unet, l2, l2_s)[0]
-            
             if l3 and l3 != "None":
-                yield log(f"💊 Aplicando LoRA 3: {l3} ({l3_s})"), None, None
+                yield log(f"💊 LoRA 3: {l3}"), None, None
                 unet = LoraNode().load_lora_model_only(unet, l3, l3_s)[0]
-            # -----------------------------
 
             guider = NODE_CLASS_MAPPINGS["CFGGuider"]().EXECUTE_NORMALIZED(cfg=1, model=unet, positive=cond_pos, negative=cond_neg)
             sigmas = NODE_CLASS_MAPPINGS["ManualSigmas"]().EXECUTE_NORMALIZED(sigmas=get_sigmas(steps))
@@ -206,8 +206,11 @@ def generate_process(
 
             sep = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]().EXECUTE_NORMALIZED(av_latent=get_v(sampled, 0))
             decoded = NODE_CLASS_MAPPINGS["VAEDecode"]().decode(samples=get_v(sep, 0), vae=vae_obj)
-            vae_aud_gpu = NODE_CLASS_MAPPINGS["VAELoaderKJ"]().load_vae(vae_name="LTX2_audio_vae_bf16.safetensors", device="cuda", weight_dtype="fp16")[0]
+            
+            # Recargar Audio VAE en GPU para decode rápido
+            vae_aud_gpu = NODE_CLASS_MAPPINGS["VAELoaderKJ"]().load_vae(vae_name=vae_audio_name, device="cuda", weight_dtype="fp16")[0]
             dec_aud = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]().EXECUTE_NORMALIZED(samples=get_v(sep, 1), audio_vae=vae_aud_gpu)[0]
+            
             vid = NODE_CLASS_MAPPINGS["CreateVideo"]().EXECUTE_NORMALIZED(fps=fps, images=get_v(decoded, 0), audio=get_v(dec_aud, 0))
             
             os.makedirs("/content/ComfyUI/output", exist_ok=True)
@@ -251,15 +254,15 @@ with gr.Blocks(title="LTX2 APP", theme=gr.themes.Soft(primary_hue="blue", second
             img = gr.Image(type="filepath", label="Imagen Base")
             
             with gr.Accordion("📂 MODELOS (CLI Default)", open=True):
-                # AQUI SE USAN LOS ARGUMENTOS (args.unet, args.vae, etc.)
+                # Usamos los argumentos CLI como valores por defecto
                 u_mod = gr.Dropdown(get_files("unet"), label="UNET", value=args.unet, allow_custom_value=True)
-                v_mod = gr.Dropdown(get_files("vae"), label="VAE", value=args.vae, allow_custom_value=True)
+                v_mod = gr.Dropdown(get_files("vae"), label="VAE Video", value=args.vae, allow_custom_value=True)
+                va_mod = gr.Dropdown(get_files("vae"), label="VAE Audio", value=args.vae_audio, allow_custom_value=True)
                 c1_mod = gr.Dropdown(get_files("clip"), label="CLIP 1", value=args.clip1, allow_custom_value=True)
                 c2_mod = gr.Dropdown(get_files("clip"), label="CLIP 2", value=args.clip2, allow_custom_value=True)
 
             with gr.Accordion("🎨 LoRAs", open=False):
                 loras = get_files("loras")
-                # Se cargan los valores por defecto desde CLI
                 l1 = gr.Dropdown(loras, label="L1", value=args.lora1, allow_custom_value=True)
                 l1s = gr.Slider(-2, 2, args.lora1_st, label="Peso")
                 
@@ -282,15 +285,24 @@ with gr.Blocks(title="LTX2 APP", theme=gr.themes.Soft(primary_hue="blue", second
             out_vid = gr.Video(); out_file = gr.File(); out_log = gr.Textbox(lines=5)
 
     def refresh():
-        return (gr.update(choices=get_files("unet")), gr.update(choices=get_files("vae")), gr.update(choices=get_files("clip")), gr.update(choices=get_files("clip")), gr.update(choices=get_files("loras")), gr.update(choices=get_files("loras")), gr.update(choices=get_files("loras")))
+        return (
+            gr.update(choices=get_files("unet")), 
+            gr.update(choices=get_files("vae")), 
+            gr.update(choices=get_files("vae")), # Para audio VAE
+            gr.update(choices=get_files("clip")), 
+            gr.update(choices=get_files("clip")), 
+            gr.update(choices=get_files("loras")), 
+            gr.update(choices=get_files("loras")), 
+            gr.update(choices=get_files("loras"))
+        )
 
-    btn_ref.click(refresh, None, [u_mod, v_mod, c1_mod, c2_mod, l1, l2, l3])
+    btn_ref.click(refresh, None, [u_mod, v_mod, va_mod, c1_mod, c2_mod, l1, l2, l3])
     btn_mon.click(stats, None, monitor)
     btn_clr.click(lambda: (clear_all(), "🧹 Limpio"), None, out_log)
     
     btn_run.click(
         generate_process,
-        [prompt, img, st, seed, steps, res, sec, fps, l1, l1s, l2, l2s, l3, l3s, u_mod, v_mod, c1_mod, c2_mod],
+        [prompt, img, st, seed, steps, res, sec, fps, l1, l1s, l2, l2s, l3, l3s, u_mod, v_mod, va_mod, c1_mod, c2_mod],
         [out_log, out_vid, out_file]
     )
 
